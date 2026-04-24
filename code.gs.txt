@@ -1,0 +1,687 @@
+// ================================================================
+// Code.gs — ระบบเยี่ยมบ้าน รพ.สต.บ้านคำใหญ่
+// ================================================================
+// ⚠️ DEPLOY SETTINGS (สำคัญมาก!):
+//   Execute as   → Me (เจ้าของ script)
+//   Who has access → Anyone
+// ================================================================
+
+const SHEET_ID    = "1dOOXOCmDWDoE6ELlvhhw7A49Mjjt-Ha_KN8N64P73wQ";
+const ADMIN_EMAIL = "phuwi2562@gmail.com";
+
+const SHEETS = {
+  USERS     : "ผู้ใช้งาน",
+  PERSONNEL : "บุคลากร",
+  TARGETS   : "กลุ่มเป้าหมาย",
+  VISITS    : "การเยี่ยมบ้าน",
+  VILLAGES  : "หมู่บ้าน",
+};
+
+const P_COLS = 11;
+const T_COLS = 22;
+const V_COLS = 53;
+
+// ================================================================
+// doGet
+// ================================================================
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile("index")
+    .setTitle("ระบบเยี่ยมบ้าน รพ.สต.บ้านคำใหญ่")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag("viewport", "width=device-width,initial-scale=1");
+}
+
+// ================================================================
+// DEBUG — รันจาก Script Editor เพื่อทดสอบ
+// ================================================================
+function debugLogin() {
+  // แก้ email/password ที่ต้องการทดสอบ แล้วรันฟังก์ชันนี้จาก script editor
+  const email = ADMIN_EMAIL;
+  const pw    = "ใส่รหัสผ่านที่ตั้งไว้ตรงนี้";  // ← เปลี่ยนตรงนี้
+
+  Logger.log("=== DEBUG LOGIN ===");
+  Logger.log("Testing: " + email);
+
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    Logger.log("✅ Sheet open OK");
+
+    const sh = ss.getSheetByName(SHEETS.USERS);
+    if (!sh) { Logger.log("❌ ไม่พบชีต ผู้ใช้งาน"); return; }
+    Logger.log("✅ Found sheet: " + SHEETS.USERS);
+    Logger.log("Rows: " + sh.getLastRow() + ", Cols: " + sh.getLastColumn());
+
+    // อ่านทุก row
+    if (sh.getLastRow() >= 2) {
+      const allRows = sh.getRange(2, 1, sh.getLastRow()-1, sh.getLastColumn()).getValues();
+      allRows.forEach((r, i) => {
+        Logger.log("Row " + (i+2) + ": id=" + r[0] + " | email=" + r[1] + " | name=" + r[2] + " | role=" + r[3] + " | status=" + r[4] + " | pw_col8=" + (r[7] !== undefined ? '"' + r[7] + '"' : "MISSING"));
+      });
+    }
+
+    const user = getUserRowByEmail(ss, email);
+    if (!user) { Logger.log("❌ ไม่พบ email: " + email); return; }
+    Logger.log("✅ Found user: " + JSON.stringify(user));
+    Logger.log("Password in sheet: '" + user.password + "'");
+    Logger.log("Password match: " + (user.password === pw));
+
+    const result = loginUser(email, pw);
+    Logger.log("loginUser result: " + JSON.stringify(result));
+  } catch(e) {
+    Logger.log("❌ ERROR: " + e.toString());
+  }
+}
+
+// ================================================================
+// AUTH — Login ด้วย Email + Password
+// ================================================================
+function loginUser(email, password) {
+  try {
+    if (!email || password === undefined || password === null) {
+      return { ok: false, error: "กรุณากรอก Email และรหัสผ่านให้ครบ" };
+    }
+
+    const ss   = SpreadsheetApp.openById(SHEET_ID);
+    const user = getUserRowByEmail(ss, String(email).trim().toLowerCase());
+
+    if (!user) {
+      return { ok: false, error: "❌ ไม่พบ Email นี้ในระบบ\nกรุณาติดต่อ Admin" };
+    }
+
+    const isActive = (user.status === "active" || user.status === "ใช้งาน");
+    if (!isActive) {
+      return { ok: false, error: "⛔ บัญชีถูกระงับ\nกรุณาติดต่อ Admin" };
+    }
+
+    if (user.password === "") {
+      return { ok: false, error: "⚠️ ยังไม่ได้ตั้งรหัสผ่าน\nกรุณาให้ Admin รัน:\nGoogle Sheets → เมนู 🏥 → '🔑 ตั้งรหัสผ่าน'" };
+    }
+
+    if (user.password !== String(password)) {
+      return { ok: false, error: "❌ รหัสผ่านไม่ถูกต้อง" };
+    }
+
+    // สร้าง session token
+    const token = Utilities.getUuid().replace(/-/g, "");
+    CacheService.getScriptCache().put(
+      "sess_" + token,
+      JSON.stringify({ email: user.email, displayName: user.displayName, role: user.role, userId: user.id }),
+      28800
+    );
+
+    return { ok: true, token, email: user.email, displayName: user.displayName, role: user.role, userId: user.id };
+
+  } catch(err) {
+    return { ok: false, error: "❌ ระบบขัดข้อง: " + err.toString() };
+  }
+}
+
+function logoutUser(token) {
+  try { if (token) CacheService.getScriptCache().remove("sess_" + token); } catch(e) {}
+  return { ok: true };
+}
+
+function getUserInfo(token) {
+  try {
+    if (!token) return { authorized: false, reason: "no_token" };
+    const raw = CacheService.getScriptCache().get("sess_" + token);
+    if (!raw) return { authorized: false, reason: "session_expired" };
+    const s = JSON.parse(raw);
+    return { authorized: true, email: s.email, displayName: s.displayName, role: s.role, userId: s.userId };
+  } catch(e) {
+    return { authorized: false, reason: "error", error: e.toString() };
+  }
+}
+
+// ================================================================
+// อ่านข้อมูล User จาก Sheet — อ่าน column ทีละตัวเพื่อความปลอดภัย
+// ================================================================
+function getUserRowByEmail(ss, email) {
+  const sh = ss.getSheetByName(SHEETS.USERS);
+  if (!sh || sh.getLastRow() < 2) return null;
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();   // เช็คจริงว่ามีกี่ cols
+
+  // อ่าน 8 cols หรือน้อยกว่าถ้าชีตมีน้อยกว่า
+  const readCols = Math.max(lastCol, 1);
+  const rows = sh.getRange(2, 1, lastRow - 1, readCols).getValues();
+
+  for (const r of rows) {
+    const rowEmail = String(r[1] || "").toLowerCase().trim();
+    if (rowEmail === String(email).toLowerCase().trim()) {
+      return {
+        id          : String(r[0] || ""),
+        email       : String(r[1] || ""),
+        displayName : String(r[2] || ""),
+        role        : String(r[3] || "staff"),
+        status      : String(r[4] || "active"),
+        note        : String(r[6] || ""),
+        // password อยู่ col 8 (index 7) — ถ้าไม่มีให้เป็น ""
+        password    : readCols >= 8 ? String(r[7] || "").trim() : "",
+      };
+    }
+  }
+  return null;
+}
+
+function getAllUserRows(ss) {
+  const sh = ss.getSheetByName(SHEETS.USERS);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const lastCol = sh.getLastColumn();
+  const readCols = Math.max(lastCol, 1);
+  return sh.getRange(2, 1, sh.getLastRow() - 1, readCols).getValues()
+    .filter(r => r[0] !== "" && r[0] !== null)
+    .map(r => ({
+      id          : String(r[0] || ""),
+      email       : String(r[1] || ""),
+      displayName : String(r[2] || ""),
+      role        : String(r[3] || "staff"),
+      status      : String(r[4] || "active"),
+      addDate     : r[5] || "",
+      note        : String(r[6] || ""),
+      password    : readCols >= 8 ? String(r[7] || "").trim() : "",
+    }));
+}
+
+// เขียน password column 8 ให้ row ที่ระบุ (สร้าง header ถ้ายังไม่มี)
+function writePasswordToRow(sh, rowNum, password) {
+  // ตรวจว่า column 8 มี header หรือยัง
+  if (sh.getLastColumn() < 8 || sh.getRange(1, 8).getValue() === "") {
+    sh.getRange(1, 8).setValue("รหัสผ่าน")
+      .setBackground("#1a237e").setFontColor("#fff")
+      .setFontWeight("bold").setFontSize(11).setHorizontalAlignment("center");
+    sh.setColumnWidth(8, 140);
+  }
+  sh.getRange(rowNum, 8).setValue(password);
+}
+
+// ================================================================
+// getAllData
+// ================================================================
+function getAllData(token) {
+  try {
+    const auth = getUserInfo(token);
+    if (!auth.authorized) return { ok: false, auth };
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    return {
+      ok: true, currentUser: auth,
+      personnel : readSheet(ss, SHEETS.PERSONNEL, P_COLS, pKeys()),
+      targets   : readSheet(ss, SHEETS.TARGETS,   T_COLS, tKeys()),
+      visits    : readSheet(ss, SHEETS.VISITS,    V_COLS, vKeys()),
+      villages  : getVillages(ss),
+    };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+
+// ================================================================
+// USERS CRUD
+// ================================================================
+function getUsers(token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    return { ok: true, users: getAllUserRows(ss).map(u => { const { password, ...r } = u; return r; }) };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+
+function saveUser(data, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  try {
+    if (!data.email || !data.displayName || !data.role) return { ok: false, error: "กรุณากรอกข้อมูลให้ครบ" };
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(SHEETS.USERS);
+
+    if (data.id && data.id !== "") {
+      // แก้ไข
+      if (!data.password || String(data.password).trim() === "") {
+        const ex = getUserRowByEmail(ss, data.email);
+        data.password = ex ? ex.password : "";
+      }
+      if (data.role !== "admin") {
+        const others = getAllUserRows(ss).filter(u => u.role === "admin" && (u.status === "active" || u.status === "ใช้งาน") && u.id !== data.id);
+        if (others.length === 0) return { ok: false, error: "ต้องมี Admin อย่างน้อย 1 คน" };
+      }
+      const row = findRowById(sh, data.id);
+      if (!row) return { ok: false, error: "ไม่พบรหัส " + data.id };
+      // เขียน 7 cols ก่อน
+      sh.getRange(row, 1, 1, 7).setValues([[
+        data.id, (data.email||"").trim().toLowerCase(), data.displayName||"",
+        data.role||"staff", data.status||"active", new Date(), data.note||""
+      ]]);
+      // เขียน password col 8
+      writePasswordToRow(sh, row, String(data.password || "").trim());
+    } else {
+      // เพิ่มใหม่
+      if (!data.password || String(data.password).trim() === "") return { ok: false, error: "กรุณากำหนดรหัสผ่านสำหรับผู้ใช้ใหม่" };
+      const existing = getUserRowByEmail(ss, data.email);
+      if (existing) return { ok: false, error: "Email นี้ถูกลงทะเบียนแล้ว" };
+      data.id = generateId("U");
+      sh.appendRow([data.id, (data.email||"").trim().toLowerCase(), data.displayName||"",
+                    data.role||"staff", data.status||"active", new Date(), data.note||"", String(data.password).trim()]);
+      // ตรวจ/สร้าง header col 8
+      writePasswordToRow(sh, sh.getLastRow(), String(data.password).trim());
+    }
+    SpreadsheetApp.flush();
+    return { ok: true, id: data.id };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+
+function deleteUser(id, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  if (auth.userId === id) return { ok: false, error: "ไม่สามารถลบบัญชีตัวเองได้" };
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const users = getAllUserRows(ss);
+    const target = users.find(u => u.id === id);
+    if (target && target.role === "admin") {
+      const admins = users.filter(u => u.role === "admin" && (u.status === "active" || u.status === "ใช้งาน") && u.id !== id);
+      if (admins.length === 0) return { ok: false, error: "ต้องมี Admin อย่างน้อย 1 คน" };
+    }
+    return deleteRowById(SHEETS.USERS, id);
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+
+// ================================================================
+// PERSONNEL CRUD
+// ================================================================
+function savePersonnel(data, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized) return { ok: false, error: "Unauthorized" };
+  if (auth.role !== "admin") return { ok: false, error: "เฉพาะ Admin เท่านั้น" };
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(SHEETS.PERSONNEL);
+    if (data.id && data.id !== "") {
+      const row = findRowById(sh, data.id);
+      if (!row) return { ok: false, error: "ไม่พบรหัส " + data.id };
+      sh.getRange(row, 1, 1, P_COLS).setValues([buildPersonnelRow(data)]);
+    } else {
+      data.id = generateId("P");
+      sh.appendRow(buildPersonnelRow(data));
+    }
+    SpreadsheetApp.flush();
+    return { ok: true, id: data.id };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+function deletePersonnel(id, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  return deleteRowById(SHEETS.PERSONNEL, id);
+}
+function buildPersonnelRow(d) {
+  return [d.id||"", d.prefix||"", d.firstName||"", d.lastName||"",
+          d.role||"", d.familyDoc||"", d.phone||"", d.email||"",
+          new Date(), d.status||"ใช้งาน", d.note||""];
+}
+
+// ================================================================
+// TARGETS CRUD
+// ================================================================
+function saveTarget(data, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized) return { ok: false, error: "Unauthorized" };
+  if (auth.role === "viewer") return { ok: false, error: "Permission denied" };
+  if (auth.role === "staff" && data.id && data.id !== "")
+    return { ok: false, error: "Staff ไม่สามารถแก้ไขทะเบียนได้" };
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(SHEETS.TARGETS);
+    if (data.id && data.id !== "") {
+      const row = findRowById(sh, data.id);
+      if (!row) return { ok: false, error: "ไม่พบรหัส " + data.id };
+      sh.getRange(row, 1, 1, T_COLS).setValues([buildTargetRow(data)]);
+    } else {
+      data.id = generateId("T");
+      sh.appendRow(buildTargetRow(data));
+    }
+    SpreadsheetApp.flush();
+    return { ok: true, id: data.id };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+function deleteTarget(id, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  return deleteRowById(SHEETS.TARGETS, id);
+}
+function buildTargetRow(d) {
+  const vn = {"1":"บ้านคำใหญ่","2":"โนนสะอาด","3":"นาโพธิ์","4":"หนองบัว","5":"ดอนดู่","6":"สะอาด"};
+  return [d.id||"", d.prefix||"", d.firstName||"", d.lastName||"", d.houseNo||"",
+          d.village||"", vn[d.village]||"", d.age||"", d.gender||"", d.idCard||"",
+          d.phone||"", d.disease||"", d.healthProblem||"", d.urgency||"", "",
+          d.doctorId||"", d.doctorName||"", new Date(), "", 0, d.status||"ยังดูแล", d.note||""];
+}
+
+// ================================================================
+// VISITS CRUD
+// ================================================================
+function saveVisit(data, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized) return { ok: false, error: "Unauthorized" };
+  if (auth.role === "viewer") return { ok: false, error: "Permission denied" };
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(SHEETS.VISITS);
+    if (data.id && data.id !== "") {
+      const row = findRowById(sh, data.id);
+      if (!row) return { ok: false, error: "ไม่พบรหัสการเยี่ยม " + data.id };
+      data.recordBy = data.recordBy || auth.displayName || auth.email;
+      sh.getRange(row, 1, 1, V_COLS).setValues([buildVisitRow(data)]);
+      updateLastVisit(ss, data.targetId, data.date);
+      SpreadsheetApp.flush();
+      return { ok: true, id: data.id, updated: true };
+    } else {
+      data.id       = generateId("V");
+      data.recordBy = auth.displayName || auth.email;
+      sh.appendRow(buildVisitRow(data));
+      updateLastVisit(ss, data.targetId, data.date);
+      SpreadsheetApp.flush();
+      return { ok: true, id: data.id, updated: false };
+    }
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+function deleteVisit(id, token) {
+  const auth = getUserInfo(token);
+  if (!auth.authorized || auth.role !== "admin") return { ok: false, error: "Permission denied" };
+  return deleteRowById(SHEETS.VISITS, id);
+}
+function buildVisitRow(d) {
+  const adlVals = [1,2,3,4,5,6,7,8,9,10].map(i=>parseInt(d['adl'+i])||0);
+  const t = d.adlTotal != null ? parseInt(d.adlTotal)||0 : adlVals.reduce((s,v)=>s+v,0);
+  const lv = t>=12?"🟢 ไม่เป็นการพึ่งพา":t>=9?"🟡 พึ่งพาปานกลาง":t>=5?"🟠 พึ่งพารุนแรง":"🔴 พึ่งพาโดยสมบูรณ์";
+  return [d.id||"", d.date?new Date(d.date):new Date(),
+          d.targetId||"", d.targetName||"", d.village||"",
+          d.personnelId||"", d.personnelName||"", d.personnelRole||"",
+          ...adlVals, t, lv, d.adlNote||"",
+          d.nutrFood||"", d.nutrApprop||"", d.nutrNote||"",
+          d.houseCondition||"", d.neighbors||"", d.homeNote||"",
+          d.caregiver||"", d.caregiverAdq||"", d.otherNote||"",
+          d.medAdherence||"", d.medList||"", d.medNote||"",
+          d.bp||"", d.hr||"", d.temp||"", d.rr||"", d.o2||"", d.dtx||"", d.examNote||"",
+          d.fallRisk||"", d.safety||"", d.safetyNote||"",
+          d.mood||"", d.belief||"", d.spiritNote||"",
+          d.access||"", d.welfare||"", d.serviceNote||"",
+          d.summary||"", d.nextVisit?new Date(d.nextVisit):"",
+          d.recordBy||"", new Date()];
+}
+function updateLastVisit(ss, targetId, visitDate) {
+  try {
+    const sh  = ss.getSheetByName(SHEETS.TARGETS);
+    const row = findRowById(sh, targetId);
+    if (!row) return;
+    sh.getRange(row, 19).setValue(visitDate ? new Date(visitDate) : new Date());
+    sh.getRange(row, 20).setValue((parseInt(sh.getRange(row, 20).getValue())||0) + 1);
+  } catch(e) { Logger.log("updateLastVisit: "+e); }
+}
+
+// ================================================================
+// KEY MAPS
+// ================================================================
+function pKeys() { return ["id","prefix","firstName","lastName","role","familyDoc","phone","email","addDate","status","note"]; }
+function tKeys() {
+  return ["id","prefix","firstName","lastName","houseNo","village","villageName","age","gender","idCard",
+          "phone","disease","healthProblem","urgency","urgencyDesc","doctorId","doctorName",
+          "addDate","lastVisit","visitCount","status","note"];
+}
+function vKeys() {
+  return ["id","date","targetId","targetName","village","personnelId","personnelName","personnelRole",
+          "adl1","adl2","adl3","adl4","adl5","adl6","adl7","adl8","adl9","adl10",
+          "adlTotal","adlLevel","adlNote",
+          "nutrFood","nutrApprop","nutrNote","houseCondition","neighbors","homeNote",
+          "caregiver","caregiverAdq","otherNote","medAdherence","medList","medNote",
+          "bp","hr","temp","rr","o2","dtx","examNote",
+          "fallRisk","safety","safetyNote","mood","belief","spiritNote",
+          "access","welfare","serviceNote","summary","nextVisit","recordBy","recordDate"];
+}
+
+// ================================================================
+// UTILITIES
+// ================================================================
+function readSheet(ss, name, numCols, keys) {
+  const sh = ss.getSheetByName(name);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,numCols).getValues()
+    .filter(r => r[0] !== "" && r[0] !== null)
+    .map(r => {
+      const obj = {};
+      keys.forEach((k, i) => {
+        let v = r[i];
+        if (v instanceof Date) v = v.getTime()>0 ? Utilities.formatDate(v,"Asia/Bangkok","yyyy-MM-dd") : "";
+        obj[k] = (v===null||v===undefined) ? "" : v;
+      });
+      return obj;
+    });
+}
+function findRowById(sheet, id) {
+  const last = sheet.getLastRow();
+  if (last < 2) return null;
+  const ids = sheet.getRange(2,1,last-1,1).getValues();
+  for (let i=0; i<ids.length; i++) {
+    if (String(ids[i][0]) === String(id)) return i+2;
+  }
+  return null;
+}
+function deleteRowById(sheetName, id) {
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(sheetName);
+    const row = findRowById(sh, id);
+    if (!row) return { ok: false, error: "ไม่พบรหัส "+id };
+    sh.deleteRow(row);
+    SpreadsheetApp.flush();
+    return { ok: true };
+  } catch(err) { return { ok: false, error: err.toString() }; }
+}
+function generateId(prefix) {
+  const d = Utilities.formatDate(new Date(),"Asia/Bangkok","yyyyMMdd");
+  return prefix + d + "-" + ("0000"+Math.floor(Math.random()*9000+1000)).slice(-4);
+}
+function getVillages(ss) {
+  try {
+    const sh = ss.getSheetByName(SHEETS.VILLAGES);
+    if (!sh || sh.getLastRow()<2) return defaultVillages();
+    return sh.getRange(2,1,sh.getLastRow()-1,3).getValues()
+      .filter(r=>r[0]!=="").map(r=>({id:String(r[1]),name:String(r[2])}));
+  } catch(e) { return defaultVillages(); }
+}
+function defaultVillages() {
+  return [{id:"1",name:"บ้านคำใหญ่"},{id:"2",name:"โนนสะอาด"},{id:"3",name:"นาโพธิ์"},
+          {id:"4",name:"หนองบัว"},{id:"5",name:"ดอนดู่"},{id:"6",name:"สะอาด"}];
+}
+
+// ================================================================
+// onOpen — เมนู Google Sheets
+// ================================================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("🏥 ระบบเยี่ยมบ้าน")
+    .addItem("⚙️  ขั้นที่ 1 — สร้างชีทใหม่ทั้งหมด", "setupAllSheets")
+    .addItem("👤 ขั้นที่ 2 — ตั้งค่า/รีเซ็ต Admin (" + ADMIN_EMAIL + ")", "addFirstAdmin")
+    .addSeparator()
+    .addItem("🔑 ตั้ง/รีเซ็ตรหัสผ่านผู้ใช้", "resetUserPassword")
+    .addItem("🐛 Debug Login (ดู Log)", "debugLogin")
+    .addSeparator()
+    .addItem("🌐 เปิด Web App", "openWebApp")
+    .addItem("✅ ตรวจสอบข้อมูลซ้ำ", "checkDuplicates")
+    .addToUi();
+}
+
+// ================================================================
+// addFirstAdmin — ตั้งค่า / อัปเดต Admin
+// ================================================================
+function addFirstAdmin() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEETS.USERS);
+  if (!sh) { ui.alert("❌ ไม่พบชีต 'ผู้ใช้งาน'\nกรุณารัน 'สร้างชีท' ก่อน"); return; }
+
+  const nameRes = ui.prompt("👤 ตั้งค่า Admin", "Email: " + ADMIN_EMAIL + "\n\nกรอกชื่อ-นามสกุล:", ui.ButtonSet.OK_CANCEL);
+  if (nameRes.getSelectedButton() !== ui.Button.OK) return;
+  const name = nameRes.getResponseText().trim();
+  if (!name) { ui.alert("❌ กรุณากรอกชื่อ"); return; }
+
+  const pwRes = ui.prompt("🔑 กำหนดรหัสผ่าน", "กรอกรหัสผ่านสำหรับ " + ADMIN_EMAIL + "\n(อย่างน้อย 6 ตัวอักษร):", ui.ButtonSet.OK_CANCEL);
+  if (pwRes.getSelectedButton() !== ui.Button.OK) return;
+  const pw = pwRes.getResponseText().trim();
+  if (!pw || pw.length < 6) { ui.alert("❌ รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร"); return; }
+
+  // ตรวจ header col 8
+  if (sh.getLastColumn() < 8 || sh.getRange(1, 8).getValue() === "") {
+    sh.getRange(1, 8).setValue("รหัสผ่าน")
+      .setBackground("#1a237e").setFontColor("#fff").setFontWeight("bold")
+      .setFontSize(11).setHorizontalAlignment("center");
+    sh.setColumnWidth(8, 140);
+    sh.setRowHeight(1, 50);
+  }
+
+  const existing = getUserRowByEmail(ss, ADMIN_EMAIL);
+  if (existing) {
+    // อัปเดต row เดิม
+    const row = findRowById(sh, existing.id);
+    if (row) {
+      sh.getRange(row, 1, 1, 7).setValues([[existing.id, ADMIN_EMAIL, name, "admin", "active", new Date(), "Admin"]]);
+      sh.getRange(row, 8).setValue(pw);
+      SpreadsheetApp.flush();
+      ui.alert("✅ อัปเดต Admin สำเร็จ!\n\nEmail: " + ADMIN_EMAIL + "\nชื่อ: " + name + "\n\nเข้าสู่ระบบได้แล้ว 🎉");
+    }
+  } else {
+    // เพิ่มใหม่
+    const newId = generateId("U");
+    sh.appendRow([newId, ADMIN_EMAIL, name, "admin", "active", new Date(), "First Admin", pw]);
+    SpreadsheetApp.flush();
+    ui.alert("✅ เพิ่ม Admin สำเร็จ!\n\nEmail: " + ADMIN_EMAIL + "\nชื่อ: " + name + "\n\nเข้าสู่ระบบได้แล้ว 🎉");
+  }
+}
+
+// ================================================================
+// resetUserPassword
+// ================================================================
+function resetUserPassword() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const users = getAllUserRows(ss);
+  if (!users.length) { ui.alert("❌ ยังไม่มีผู้ใช้งาน"); return; }
+
+  const list = users.map((u,i) => (i+1) + ". " + u.email + " | " + u.displayName + " (" + u.role + ")").join("\n");
+  const emailRes = ui.prompt("🔑 ตั้ง/รีเซ็ตรหัสผ่าน", "ผู้ใช้งาน:\n" + list + "\n\nกรอก Email:", ui.ButtonSet.OK_CANCEL);
+  if (emailRes.getSelectedButton() !== ui.Button.OK) return;
+
+  const email = emailRes.getResponseText().trim().toLowerCase();
+  const user  = users.find(u => u.email.toLowerCase() === email);
+  if (!user) { ui.alert("❌ ไม่พบ Email: " + email); return; }
+
+  const pwRes = ui.prompt("🔑 รหัสผ่านใหม่", "รหัสผ่านใหม่สำหรับ " + user.email + "\n(อย่างน้อย 6 ตัวอักษร):", ui.ButtonSet.OK_CANCEL);
+  if (pwRes.getSelectedButton() !== ui.Button.OK) return;
+  const pw = pwRes.getResponseText().trim();
+  if (!pw || pw.length < 6) { ui.alert("❌ รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร"); return; }
+
+  const sh  = ss.getSheetByName(SHEETS.USERS);
+  const row = findRowById(sh, user.id);
+  if (!row) { ui.alert("❌ ไม่พบแถว"); return; }
+
+  writePasswordToRow(sh, row, pw);
+  SpreadsheetApp.flush();
+  ui.alert("✅ ตั้งรหัสผ่านสำเร็จ!\nEmail: " + user.email + "\n\nผู้ใช้เข้าสู่ระบบได้แล้ว 🎉");
+}
+
+function openWebApp() {
+  const url  = ScriptApp.getService().getUrl();
+  const html = HtmlService.createHtmlOutput('<script>window.open("'+url+'","_blank");google.script.host.close();</script>');
+  SpreadsheetApp.getUi().showModalDialog(html, "กำลังเปิด...");
+}
+
+// ================================================================
+// setupAllSheets
+// ================================================================
+function setupAllSheets() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  setupUsersSheet(ss);
+  setupPersonnelSheet(ss);
+  setupTargetsSheet(ss);
+  setupVisitsSheet(ss);
+  setupVillagesSheet(ss);
+  setupDashboardSheet(ss);
+  const def = ss.getSheetByName("Sheet1");
+  if (def) ss.deleteSheet(def);
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert("✅ สร้างชีทเรียบร้อย!\n\nขั้นต่อไป:\n1. รัน 'ตั้งค่า/รีเซ็ต Admin'\n2. Deploy ใหม่ (Execute as: Me, Anyone)\n3. เปิด Web App และ Login");
+}
+
+function hdr(sheet, headers, bg) {
+  sheet.getRange(1,1,1,headers.length).setValues([headers])
+    .setBackground(bg).setFontColor("#fff").setFontWeight("bold")
+    .setFontSize(11).setHorizontalAlignment("center").setWrap(true);
+  sheet.setRowHeight(1,50);
+  sheet.setFrozenRows(1);
+}
+function setupUsersSheet(ss) {
+  let s = ss.getSheetByName("ผู้ใช้งาน") || ss.insertSheet("ผู้ใช้งาน",0);
+  s.clear();
+  hdr(s,["รหัสผู้ใช้","Email","ชื่อ-นามสกุล","บทบาท","สถานะ","วันที่เพิ่ม","หมายเหตุ","รหัสผ่าน"],"#1a237e");
+  [90,200,160,110,90,120,160,140].forEach((w,i)=>s.setColumnWidth(i+1,w));
+  s.getRange("D2:D1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["admin","staff","viewer"],true).build());
+  s.getRange("E2:E1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["active","inactive"],true).build());
+  s.hideColumns(8);
+}
+function setupPersonnelSheet(ss) {
+  let s = ss.getSheetByName("บุคลากร") || ss.insertSheet("บุคลากร");
+  s.clear();
+  hdr(s,["รหัสบุคลากร","คำนำหน้า","ชื่อ","นามสกุล","ตำแหน่ง","หมอครอบครัวคนที่","เบอร์","อีเมล","วันที่เพิ่ม","สถานะ","หมายเหตุ"],"#1565C0");
+  s.getRange("E2:E1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["นายแพทย์","แพทย์เวชศาสตร์ครอบครัว","พยาบาลวิชาชีพ","นักวิชาการสาธารณสุข","เจ้าพนักงานสาธารณสุข","ทันตาภิบาล","แพทย์แผนไทย","อาสาสมัครสาธารณสุข (อสม.)"],true).build());
+  s.getRange("J2:J1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["ใช้งาน","ไม่ใช้งาน"],true).build());
+}
+function setupTargetsSheet(ss) {
+  let s = ss.getSheetByName("กลุ่มเป้าหมาย") || ss.insertSheet("กลุ่มเป้าหมาย");
+  s.clear();
+  hdr(s,["รหัส","คำนำหน้า","ชื่อ","นามสกุล","บ้านเลขที่","หมู่ที่","ชื่อหมู่บ้าน","อายุ","เพศ","เลขบัตร","เบอร์","โรคประจำตัว","ปัญหาสุขภาพ","ระดับเร่งด่วน","คำอธิบาย","รหัสหมอ","ชื่อหมอ","วันที่เพิ่ม","เยี่ยมล่าสุด","ครั้งที่เยี่ยม","สถานะ","หมายเหตุ"],"#1B5E20");
+  s.getRange("F2:F1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["1","2","3","4","5","6"],true).build());
+  s.getRange("N2:N1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["1","2","3"],true).build());
+  s.getRange("U2:U1000").setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["ยังดูแล","จำหน่าย","เสียชีวิต","ย้ายออก"],true).build());
+}
+function setupVisitsSheet(ss) {
+  let s = ss.getSheetByName("การเยี่ยมบ้าน") || ss.insertSheet("การเยี่ยมบ้าน");
+  s.clear();
+  hdr(s,["รหัสการเยี่ยม","วันที่","รหัสเป้าหมาย","ผู้รับการเยี่ยม","หมู่ที่","รหัสผู้เยี่ยม","ผู้เยี่ยม","ตำแหน่ง",
+         "ADL1","ADL2","ADL3","ADL4","ADL5","ADL6","ADL7","ADL8","ADL9","ADL10",
+         "ADL รวม","ระดับ ADL","หมายเหตุ ADL","N_อาหาร","N_ความเหมาะสม","N_note",
+         "H_บ้าน","H_เพื่อนบ้าน","H_note","O_ผู้ดูแล","O_ความเพียงพอ","O_note",
+         "M_สม่ำเสมอ","M_ยา","M_note","E_BP","E_HR","E_Temp","E_RR","E_O2","E_DTX","E_note",
+         "S1_หกล้ม","S1_ปลอดภัย","S1_note","S2_จิตใจ","S2_ความเชื่อ","S2_note",
+         "S3_บริการ","S3_สวัสดิการ","S3_note","สรุปปัญหา","วันนัด","บันทึกโดย","วันที่บันทึก"],"#4A148C");
+}
+function setupVillagesSheet(ss) {
+  let s = ss.getSheetByName("หมู่บ้าน") || ss.insertSheet("หมู่บ้าน");
+  s.clear();
+  hdr(s,["รหัส","หมู่ที่","ชื่อหมู่บ้าน","ตำบล","อำเภอ","จังหวัด"],"#E65100");
+  [["V01","1","บ้านคำใหญ่"],["V02","2","โนนสะอาด"],["V03","3","นาโพธิ์"],
+   ["V04","4","หนองบัว"],["V05","5","ดอนดู่"],["V06","6","สะอาด"]]
+    .forEach((r,i)=>s.getRange(i+2,1,1,6).setValues([[r[0],r[1],r[2],"คำใหญ่","ห้วยเม็ก","กาฬสินธ์ุ"]]));
+}
+function setupDashboardSheet(ss) {
+  let s = ss.getSheetByName("Dashboard") || ss.insertSheet("Dashboard",0);
+  s.clear();
+  s.getRange("A1:D1").merge().setValue("📊 Dashboard รพ.สต.บ้านคำใหญ่")
+    .setBackground("#1565C0").setFontColor("#fff").setFontSize(14).setFontWeight("bold").setHorizontalAlignment("center");
+  s.setRowHeight(1,40);
+  [["A3","กลุ่มเป้าหมาย",'=COUNTA(กลุ่มเป้าหมาย!A2:A10000)-COUNTBLANK(กลุ่มเป้าหมาย!A2:A10000)'],
+   ["A4","การเยี่ยม",'=COUNTA(การเยี่ยมบ้าน!A2:A10000)-COUNTBLANK(การเยี่ยมบ้าน!A2:A10000)'],
+   ["A5","บุคลากร",'=COUNTA(บุคลากร!A2:A10000)-COUNTBLANK(บุคลากร!A2:A10000)'],
+   ["A6","ผู้ใช้งาน",'=COUNTA(ผู้ใช้งาน!A2:A10000)-COUNTBLANK(ผู้ใช้งาน!A2:A10000)']]
+    .forEach(r=>{s.getRange(r[0]).setValue(r[1]).setFontWeight("bold"); s.getRange(r[0].replace("A","B")).setFormula(r[2]);});
+}
+function checkDuplicates() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEETS.TARGETS);
+  if (!sh||sh.getLastRow()<2) return;
+  const data = sh.getRange(2,1,sh.getLastRow()-1,4).getValues();
+  const seen = {}; let dups = 0;
+  data.forEach((r,i)=>{
+    const k=r[2]+"_"+r[3];
+    if(seen[k]&&r[2]){sh.getRange(i+2,1,1,4).setBackground("#FFCDD2");dups++;}
+    else seen[k]=true;
+  });
+  SpreadsheetApp.getUi().alert(dups?"⚠️ พบซ้ำ "+dups+" รายการ":"✅ ไม่พบซ้ำ");
+}
